@@ -1,0 +1,9 @@
+manifest_version = 1
+
+[bot]
+name = "local-adaptive3p"
+display = "Local Adaptive AI (3P)"
+description = "Self-learning neural network for 3-player mahjong."
+version = "1.0.0"
+
+[settings]

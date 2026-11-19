@@ -3,19 +3,96 @@ import os
 import sys
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+BUNDLED_SITE_PACKAGES = os.path.join(
+    BASE_DIR, "runtime", "python", "aarch64-apple-darwin", "lib", "python3.12", "site-packages"
+)
+if os.path.exists(BUNDLED_SITE_PACKAGES) and BUNDLED_SITE_PACKAGES not in sys.path:
+    sys.path.append(BUNDLED_SITE_PACKAGES)
+
 sys.path.insert(0, os.path.join(BASE_DIR, "auto_learn"))
 
-from model_core import AdaptiveMjaiBot
+import base_engine
+from model_core import HybridNeuralEvaluator
 
-def main():
-    bot = AdaptiveMjaiBot(BASE_DIR, "3p")
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
+evaluator = HybridNeuralEvaluator(BASE_DIR, "3p")
+original_decide_tsumo = base_engine.decide_after_own_tsumo
+
+def neural_guided_decide_tsumo(state, last_event):
+    actor = state.actor_id
+    drawn = last_event["pai"]
+    drawn_idx = base_engine._to34(drawn)
+
+    hand14 = list(state.hand34)
+    res = base_engine._hand_value(state, hand14, state.aka_in_hand, drawn_idx, is_tsumo=True)
+    if res.cost is not None:
+        return {"type": "hora", "actor": actor, "target": actor, "pai": drawn}
+
+    if state.reach_accepted:
+        return {"type": "dahai", "actor": actor, "pai": drawn, "tsumogiri": True}
+
+    if not evaluator.is_loaded:
+        return original_decide_tsumo(state, last_event)
+
+    nn_scores = evaluator.score_tiles(state)
+
+    if state.is_closed() and not state.reach_declared and state.left_tiles >= 4:
+        best_riichi = None
+        for idx in range(34):
+            if hand14[idx] == 0:
+                continue
+            test = list(hand14)
+            test[idx] -= 1
+            if base_engine._shanten_with_melds(test, len(state.melds)) != 0:
+                continue
+            waits = base_engine._tenpai_waits(test, len(state.melds))
+            if len(waits) >= 2:
+                score = len(waits) * 2.0 + nn_scores[idx]
+                if best_riichi is None or score > best_riichi[0]:
+                    best_riichi = (score, idx)
+        if best_riichi is not None:
+            return {"type": "reach", "actor": actor}
+
+    best_choice = None
+    for idx in range(34):
+        if hand14[idx] == 0:
             continue
-        event = json.loads(line)
-        response = bot.handle_event(event)
-        print(json.dumps(response), flush=True)
+        test = list(hand14)
+        test[idx] -= 1
+        sh = base_engine._shanten_with_melds(test, len(state.melds))
+        uke = base_engine._effective_ukeire(state, test)
+        pai = base_engine._from34(idx)
+        if idx in (4, 13, 22):
+            suit = "mps"[idx // 9]
+            if state.aka_in_hand.get(suit, 0) > 0 and hand14[idx] - state.aka_in_hand.get(suit, 0) == 0:
+                pai = f"5{suit}r"
+        hybrid_rank = (sh, -(nn_scores[idx] * 10.0 + uke), pai)
+        if best_choice is None or hybrid_rank < best_choice:
+            best_choice = hybrid_rank
+
+    if best_choice is not None:
+        _, _, pai = best_choice
+        return {
+            "type": "dahai",
+            "actor": actor,
+            "pai": pai,
+            "tsumogiri": pai == drawn,
+        }
+    return original_decide_tsumo(state, last_event)
+
+def announce_status():
+    state_path = os.path.join(BASE_DIR, "auto_learn", "train_state.json")
+    if os.path.exists(state_path):
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                info = json.load(f).get("3p", {})
+            acc = info.get("best_acc", 0.0) * 100
+            base_engine.notify("success", "Local Adaptive AI (3P) 起動", f"検証一致率: {acc:.1f}%", id="local-ai-3p")
+            return
+        except Exception:
+            pass
+    base_engine.notify("info", "Local Adaptive AI (3P) 起動", "ハイブリッド推論モードで稼働中", id="local-ai-3p")
 
 if __name__ == "__main__":
-    main()
+    base_engine.decide_after_own_tsumo = neural_guided_decide_tsumo
+    announce_status()
+    base_engine.main()

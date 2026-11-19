@@ -51,116 +51,62 @@ def build_feature_vector(hand, my_discards, all_discards, dora_vec, bakaze, jika
     ] + r_padded + k_padded
     return hand_vec + my_disc_vec + all_disc_vec + dora_vec + context_vec
 
-class AdaptiveMjaiBot:
+def extract_features_from_engine_state(state, num_players):
+    hand_vec = [min(c * 0.25, 1.0) for c in state.hand34]
+    my_disc_vec = [0.0] * 34
+    all_disc_vec = [0.0] * 34
+    for seat_idx, river in enumerate(state.rivers):
+        for t in river:
+            base = normalize_tile(t)
+            if base in TILE_TO_IDX:
+                idx = TILE_TO_IDX[base]
+                all_disc_vec[idx] = min(all_disc_vec[idx] + 0.25, 1.0)
+                if seat_idx == state.actor_id:
+                    my_disc_vec[idx] = min(my_disc_vec[idx] + 0.25, 1.0)
+    dora_vec = [0.0] * 34
+    for dm in getattr(state, "dora_markers", []):
+        base = normalize_tile(dm)
+        if base in TILE_TO_IDX:
+            dora_vec[TILE_TO_IDX[base]] = 1.0
+    bakaze = TILE_TO_IDX.get(state.round_wind_mjai(), 27)
+    jikaze = TILE_TO_IDX.get(state.seat_wind_mjai(), 27)
+    turn_count = len(state.rivers[state.actor_id])
+    riichi_flags = [0.0] * 4
+    for s in getattr(state, "reach_accepted_seats", set()):
+        if 0 <= s < 4:
+            riichi_flags[s] = 1.0
+    kita_counts = [0.0] * 4
+    if hasattr(state, "kita"):
+        for s in range(min(4, len(state.kita))):
+            kita_counts[s] = min(len(state.kita[s]) * 0.25, 1.0)
+    context_vec = [
+        1.0 if num_players == 3 else 0.0,
+        1.0 if bakaze == 27 else 0.0,
+        1.0 if bakaze == 28 else 0.0,
+        1.0 if jikaze == 27 else 0.0,
+        min(turn_count / 18.0, 1.0)
+    ] + riichi_flags + kita_counts
+    return hand_vec + my_disc_vec + all_disc_vec + dora_vec + context_vec
+
+class HybridNeuralEvaluator:
     def __init__(self, base_dir, mode):
         self.mode = mode
         self.num_players = 3 if mode == "3p" else 4
-        model_path = os.path.join(base_dir, "auto_learn", "models", f"active_model_{mode}.pt")
+        self.model_path = os.path.join(base_dir, "auto_learn", "models", f"active_model_{mode}.pt")
         self.device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
         self.model = MahjongPolicyNet().to(self.device)
-        if os.path.exists(model_path):
-            state = torch.load(model_path, map_location=self.device, weights_only=True)
+        self.is_loaded = False
+        if os.path.exists(self.model_path):
+            state = torch.load(self.model_path, map_location=self.device, weights_only=True)
             self.model.load_state_dict(state)
+            self.is_loaded = True
         self.model.eval()
-        self.actor_id = 0
-        self.hand = []
-        self.my_discards = [0] * 34
-        self.all_discards = [0] * 34
-        self.dora_vec = [0.0] * 34
-        self.riichi_flags = [0.0] * 4
-        self.kita_counts = [0] * 4
-        self.bakaze = 27
-        self.jikaze = 27
-        self.turn_count = 0
 
-    def choose_discard(self):
-        if not self.hand:
-            return None
-        features = build_feature_vector(
-            self.hand,
-            self.my_discards,
-            self.all_discards,
-            self.dora_vec,
-            self.bakaze,
-            self.jikaze,
-            self.turn_count,
-            self.riichi_flags,
-            self.kita_counts,
-            self.num_players
-        )
-        state_tensor = torch.tensor([features], dtype=torch.float32, device=self.device)
+    def score_tiles(self, state):
+        if not self.is_loaded:
+            return [0.0] * 34
+        features = extract_features_from_engine_state(state, self.num_players)
+        tensor_x = torch.tensor([features], dtype=torch.float32, device=self.device)
         with torch.no_grad():
-            logits = self.model(state_tensor)[0]
-        best_tile = self.hand[0]
-        best_score = -1e9
-        for t in self.hand:
-            idx = TILE_TO_IDX.get(normalize_tile(t), -1)
-            score = logits[idx].item() if idx >= 0 else -1e9
-            if score > best_score:
-                best_score = score
-                best_tile = t
-        return best_tile
-
-    def handle_event(self, event):
-        etype = event.get("type")
-        if etype == "start_game":
-            self.actor_id = event.get("id", 0)
-        elif etype == "start_kyoku":
-            self.my_discards = [0] * 34
-            self.all_discards = [0] * 34
-            self.dora_vec = [0.0] * 34
-            self.riichi_flags = [0.0] * 4
-            self.kita_counts = [0] * 4
-            self.turn_count = 0
-            self.bakaze = TILE_TO_IDX.get(event.get("bakaze", "E"), 27)
-            oya = event.get("oya", 0)
-            self.jikaze = 27 + ((self.actor_id - oya) % self.num_players)
-            dora_marker = event.get("dora_marker")
-            if dora_marker:
-                base = normalize_tile(dora_marker)
-                if base in TILE_TO_IDX:
-                    self.dora_vec[TILE_TO_IDX[base]] = 1.0
-            tehais = event.get("tehais", [])
-            if len(tehais) > self.actor_id:
-                self.hand = list(tehais[self.actor_id])
-        elif etype == "tsumo":
-            if event.get("actor") == self.actor_id:
-                self.turn_count += 1
-                pai = event.get("pai")
-                if pai:
-                    self.hand.append(pai)
-                chosen = self.choose_discard()
-                if chosen:
-                    return {"type": "dahai", "actor": self.actor_id, "pai": chosen, "tsumogiri": chosen == pai}
-        elif etype == "dahai":
-            actor = event.get("actor")
-            pai = event.get("pai")
-            if pai:
-                base = normalize_tile(pai)
-                if base in TILE_TO_IDX:
-                    idx = TILE_TO_IDX[base]
-                    self.all_discards[idx] += 1
-                    if actor == self.actor_id:
-                        self.my_discards[idx] += 1
-                if actor == self.actor_id and pai in self.hand:
-                    self.hand.remove(pai)
-        elif etype == "reach":
-            actor = event.get("actor")
-            if actor is not None and 0 <= actor < 4:
-                self.riichi_flags[actor] = 1.0
-        elif etype == "nukidora":
-            actor = event.get("actor")
-            if actor is not None and 0 <= actor < 4:
-                self.kita_counts[actor] += 1
-                if actor == self.actor_id and "N" in self.hand:
-                    self.hand.remove("N")
-        elif etype in ("pon", "chi", "kan", "daiminkan", "kakan", "ankan"):
-            if event.get("actor") == self.actor_id:
-                for c in event.get("consumed", []):
-                    if c in self.hand:
-                        self.hand.remove(c)
-                if etype in ("pon", "chi"):
-                    chosen = self.choose_discard()
-                    if chosen:
-                        return {"type": "dahai", "actor": self.actor_id, "pai": chosen, "tsumogiri": False}
-        return {"type": "none"}
+            logits = self.model(tensor_x)[0]
+        return logits.cpu().tolist()

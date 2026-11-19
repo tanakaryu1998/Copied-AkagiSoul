@@ -8,4 +8,4 @@ history/
 logs/
 ca/
 .DS_Store
-EOF
+EOF.venv/
