@@ -1,0 +1,11 @@
+cat << 'EOF' > .gitignore
+runtime/python/*/lib/python*/site-packages/
+auto_learn/models/
+auto_learn/archive/
+auto_learn/trainer.lock
+auto_learn/train_state.json
+history/
+logs/
+ca/
+.DS_Store
+EOF
