@@ -9,7 +9,7 @@ from datetime import datetime
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-from model_core import TILE_TO_IDX, MahjongPolicyNet, build_feature_vector, normalize_tile
+from model_core import TILE_TO_IDX, MahjongMultiTaskNet, build_feature_vector, normalize_tile
 
 MIN_VAL_SAMPLES = 1500
 PROMOTION_THRESHOLD = 0.78
@@ -18,17 +18,36 @@ REQUIRED_STREAK = 2
 
 def parse_game_file(filepath):
     samples_x = []
-    samples_y = []
+    samples_y_policy = []
+    samples_y_danger = []
+
     hands = [[], [], [], []]
     my_discards = [[0] * 34 for _ in range(4)]
     all_discards = [0] * 34
+    tedashi_by_seat = [[0] * 34 for _ in range(4)]
+    melds_by_seat = [[0] * 34 for _ in range(4)]
     dora_vec = [0.0] * 34
     riichi_flags = [0.0] * 4
     kita_counts = [0] * 4
     turn_counts = [0] * 4
+    last_discard_idx = -1
     bakaze = 27
     oya = 0
     num_players = 4
+
+    kyoku_buffer = []
+    danger_tiles_in_kyoku = set()
+
+    def flush_kyoku():
+        if not kyoku_buffer:
+            return
+        danger_vec = [1.0 if i in danger_tiles_in_kyoku else 0.0 for i in range(34)]
+        for bx, by in kyoku_buffer:
+            samples_x.append(bx)
+            samples_y_policy.append(by)
+            samples_y_danger.append(danger_vec)
+        kyoku_buffer.clear()
+        danger_tiles_in_kyoku.clear()
 
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
@@ -41,12 +60,16 @@ def parse_game_file(filepath):
                 continue
             etype = ev.get("type")
             if etype == "start_kyoku":
+                flush_kyoku()
                 my_discards = [[0] * 34 for _ in range(4)]
                 all_discards = [0] * 34
+                tedashi_by_seat = [[0] * 34 for _ in range(4)]
+                melds_by_seat = [[0] * 34 for _ in range(4)]
                 dora_vec = [0.0] * 34
                 riichi_flags = [0.0] * 4
                 kita_counts = [0] * 4
                 turn_counts = [0] * 4
+                last_discard_idx = -1
                 bakaze = TILE_TO_IDX.get(ev.get("bakaze", "E"), 27)
                 oya = ev.get("oya", 0)
                 dora_marker = ev.get("dora_marker")
@@ -75,25 +98,36 @@ def parse_game_file(filepath):
                     base = normalize_tile(pai)
                     target_idx = TILE_TO_IDX.get(base, -1)
                     if target_idx >= 0 and len(hands[actor]) >= 13:
+                        opp_tedashi = [0] * 34
+                        opp_melds = [0] * 34
+                        for s in range(num_players):
+                            if s != actor:
+                                for k in range(34):
+                                    opp_tedashi[k] += tedashi_by_seat[s][k]
+                                    opp_melds[k] += melds_by_seat[s][k]
                         jikaze = 27 + ((actor - oya) % num_players)
                         vec = build_feature_vector(
                             hands[actor],
                             my_discards[actor],
                             all_discards,
+                            opp_tedashi,
+                            opp_melds,
                             dora_vec,
+                            last_discard_idx,
                             bakaze,
                             jikaze,
                             turn_counts[actor],
                             riichi_flags,
-                            kita_counts,
+                            kita_counts[:3],
                             num_players
                         )
-                        samples_x.append(vec)
-                        samples_y.append(target_idx)
-                    if base in TILE_TO_IDX:
-                        idx = TILE_TO_IDX[base]
-                        all_discards[idx] += 1
-                        my_discards[actor][idx] += 1
+                        kyoku_buffer.append((vec, target_idx))
+                    if target_idx >= 0:
+                        last_discard_idx = target_idx
+                        all_discards[target_idx] += 1
+                        my_discards[actor][target_idx] += 1
+                        if not ev.get("tsumogiri", False):
+                            tedashi_by_seat[actor][target_idx] += 1
                     if pai in hands[actor]:
                         hands[actor].remove(pai)
             elif etype == "reach":
@@ -109,11 +143,41 @@ def parse_game_file(filepath):
             elif etype in ("pon", "chi", "kan", "daiminkan", "kakan", "ankan"):
                 actor = ev.get("actor")
                 if actor is not None and 0 <= actor < 4:
+                    pai = ev.get("pai")
+                    if pai:
+                        idx = TILE_TO_IDX.get(normalize_tile(pai), -1)
+                        if idx >= 0:
+                            melds_by_seat[actor][idx] += 1
                     for c in ev.get("consumed", []):
+                        c_idx = TILE_TO_IDX.get(normalize_tile(c), -1)
+                        if c_idx >= 0:
+                            melds_by_seat[actor][c_idx] += 1
                         if c in hands[actor]:
                             hands[actor].remove(c)
+            elif etype == "hora":
+                pai = ev.get("pai")
+                if pai:
+                    idx = TILE_TO_IDX.get(normalize_tile(pai), -1)
+                    if idx >= 0:
+                        danger_tiles_in_kyoku.add(idx)
+                for th in ev.get("tehais", []):
+                    for t in th:
+                        idx = TILE_TO_IDX.get(normalize_tile(t), -1)
+                        if idx >= 0:
+                            danger_tiles_in_kyoku.add(idx)
+            elif etype == "ryukyoku":
+                for th in ev.get("tehais", []):
+                    for t in th:
+                        idx = TILE_TO_IDX.get(normalize_tile(t), -1)
+                        if idx >= 0:
+                            danger_tiles_in_kyoku.add(idx)
+                flush_kyoku()
+            elif etype == "end_kyoku":
+                flush_kyoku()
+
+    flush_kyoku()
     mode = "3p" if num_players == 3 else "4p"
-    return mode, samples_x, samples_y
+    return mode, samples_x, samples_y_policy, samples_y_danger
 
 def list_history_files(history_dir):
     patterns = [
@@ -126,23 +190,29 @@ def list_history_files(history_dir):
         files.update(glob.glob(p, recursive=True))
     return sorted(files)
 
-def evaluate_blocks(model, val_x, val_y, device):
+def evaluate_blocks(model, val_x, val_yp, val_yd, device):
     model.eval()
     total_len = len(val_x)
     if total_len < MIN_VAL_SAMPLES:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
     block_size = total_len // 3
     block_accs = []
+    danger_accs = []
     with torch.no_grad():
         for b in range(3):
             start = b * block_size
             end = total_len if b == 2 else (b + 1) * block_size
             bx = torch.tensor(val_x[start:end], dtype=torch.float32, device=device)
-            by = torch.tensor(val_y[start:end], dtype=torch.long, device=device)
-            preds = model(bx).argmax(dim=1)
-            acc = (preds == by).sum().item() / by.size(0)
+            byp = torch.tensor(val_yp[start:end], dtype=torch.long, device=device)
+            byd = torch.tensor(val_yd[start:end], dtype=torch.float32, device=device)
+            p_logits, d_logits = model(bx)
+            preds = p_logits.argmax(dim=1)
+            acc = (preds == byp).sum().item() / byp.size(0)
             block_accs.append(acc)
-    return sum(block_accs) / 3.0, min(block_accs)
+            d_preds = (torch.sigmoid(d_logits) >= 0.5).float()
+            d_acc = (d_preds == byd).float().mean().item()
+            danger_accs.append(d_acc)
+    return sum(block_accs) / 3.0, min(block_accs), sum(danger_accs) / 3.0
 
 def promote_bot_in_config(config_path, mode):
     if not os.path.exists(config_path):
@@ -159,7 +229,7 @@ def promote_bot_in_config(config_path, mode):
             f.write(updated)
         os.replace(tmp_cfg, config_path)
 
-def train_mode(base_dir, mode, all_x, all_y, file_count, state_all):
+def train_mode(base_dir, mode, all_x, all_yp, all_yd, file_count, state_all):
     active_model_path = os.path.join(base_dir, "auto_learn", "models", f"active_model_{mode}.pt")
     shadow_model_path = os.path.join(base_dir, "auto_learn", "models", f"shadow_model_{mode}.pt")
     archive_dir = os.path.join(base_dir, "auto_learn", "archive")
@@ -171,7 +241,8 @@ def train_mode(base_dir, mode, all_x, all_y, file_count, state_all):
 
     split = int(len(all_x) * 0.80)
     val_x = all_x[split:]
-    val_y = all_y[split:]
+    val_yp = all_yp[split:]
+    val_yd = all_yd[split:]
     if len(val_x) < MIN_VAL_SAMPLES:
         mode_state["file_count"] = file_count
         mode_state["val_samples"] = len(val_x)
@@ -179,28 +250,36 @@ def train_mode(base_dir, mode, all_x, all_y, file_count, state_all):
 
     train_ds = TensorDataset(
         torch.tensor(all_x[:split], dtype=torch.float32),
-        torch.tensor(all_y[:split], dtype=torch.long)
+        torch.tensor(all_yp[:split], dtype=torch.long),
+        torch.tensor(all_yd[:split], dtype=torch.float32)
     )
     train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    model = MahjongPolicyNet().to(device)
+    model = MahjongMultiTaskNet().to(device)
     if os.path.exists(shadow_model_path):
-        model.load_state_dict(torch.load(shadow_model_path, map_location=device, weights_only=True))
+        try:
+            model.load_state_dict(torch.load(shadow_model_path, map_location=device, weights_only=True))
+        except Exception:
+            pass
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=4e-4, weight_decay=2e-4)
-    criterion = nn.CrossEntropyLoss()
+    policy_criterion = nn.CrossEntropyLoss()
+    danger_criterion = nn.BCEWithLogitsLoss()
 
     for _ in range(8):
         model.train()
-        for bx, by in train_loader:
-            bx, by = bx.to(device), by.to(device)
+        for bx, byp, byd in train_loader:
+            bx, byp, byd = bx.to(device), byp.to(device), byd.to(device)
             optimizer.zero_grad()
-            loss = criterion(model(bx), by)
+            p_logits, d_logits = model(bx)
+            loss_p = policy_criterion(p_logits, byp)
+            loss_d = danger_criterion(d_logits, byd)
+            loss = loss_p + 0.5 * loss_d
             loss.backward()
             optimizer.step()
 
-    mean_acc, min_block_acc = evaluate_blocks(model, val_x, val_y, device)
+    mean_acc, min_block_acc, danger_acc = evaluate_blocks(model, val_x, val_yp, val_yd, device)
     best_acc = mode_state.get("best_acc", 0.0)
     promoted = mode_state.get("promoted", False)
     streak = mode_state.get("streak", 0)
@@ -236,6 +315,7 @@ def train_mode(base_dir, mode, all_x, all_y, file_count, state_all):
         "val_samples": len(val_x),
         "last_mean_acc": round(mean_acc, 4),
         "last_min_block_acc": round(min_block_acc, 4),
+        "danger_read_acc": round(danger_acc, 4),
         "best_acc": round(best_acc, 4),
         "streak": streak,
         "promoted": promoted,
@@ -263,14 +343,15 @@ def run_training():
         except Exception:
             state_all = {}
 
-    data_by_mode = {"4p": ([], []), "3p": ([], [])}
+    data_by_mode = {"4p": ([], [], []), "3p": ([], [], [])}
     counts_by_mode = {"4p": 0, "3p": 0}
 
     for fp in files:
-        mode, sx, sy = parse_game_file(fp)
+        mode, sx, syp, syd = parse_game_file(fp)
         counts_by_mode[mode] += 1
         data_by_mode[mode][0].extend(sx)
-        data_by_mode[mode][1].extend(sy)
+        data_by_mode[mode][1].extend(syp)
+        data_by_mode[mode][2].extend(syd)
 
     for mode in ("4p", "3p"):
         state_all[mode] = train_mode(
@@ -278,6 +359,7 @@ def run_training():
             mode,
             data_by_mode[mode][0],
             data_by_mode[mode][1],
+            data_by_mode[mode][2],
             counts_by_mode[mode],
             state_all
         )
