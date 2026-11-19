@@ -1,5 +1,5 @@
 [general]
-first_run_completed = false
+first_run_completed = true
 developer_mode = false
 
 [logging]
@@ -35,14 +35,14 @@ proxy = ""
 react_timeout_ms = 3000
 
 [capture]
-mode = "mitm"
+mode = "chromium"
 
 [capture.chromium]
 executable = ""
 user_data_dir = ""
 start_url = "https://game.maj-soul.com/1/"
 cft_channel = "stable"
-force_cft = false
+force_cft = true
 extra_args = []
 block_telemetry = true
 
