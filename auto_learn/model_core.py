@@ -1,6 +1,8 @@
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from safetensors.torch import load_file
 
 TILE_TYPES = [
     "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m",
@@ -10,190 +12,258 @@ TILE_TYPES = [
 ]
 TILE_TO_IDX = {t: i for i, t in enumerate(TILE_TYPES)}
 
+TILE34_TO_COMPACT = [
+    0, None, None, None, None, None, None, None, 1,
+    2, 3, 4, 5, 6, 7, 8, 9, 10,
+    11, 12, 13, 14, 15, 16, 17, 18, 19,
+    20, 21, 22, 23, 24, 25, 26
+]
+
+COMPACT_TO_TILE34 = [
+    0, 8,
+    9, 10, 11, 12, 13, 14, 15, 16, 17,
+    18, 19, 20, 21, 22, 23, 24, 25, 26,
+    27, 28, 29, 30, 31, 32, 33
+]
+
 def normalize_tile(tile_str):
     if tile_str.endswith("r"):
         return tile_str[:-1]
     return tile_str
 
-class MahjongMultiTaskNet(nn.Module):
-    def __init__(self):
+def tile34_from_str(tile_str):
+    return TILE_TO_IDX.get(normalize_tile(tile_str), -1)
+
+def compact_idx_from_34(t34, num_players):
+    if t34 < 0 or t34 >= 34:
+        return None
+    if num_players == 3:
+        return TILE34_TO_COMPACT[t34]
+    return t34
+
+def tile_str_from_compact(c_idx, num_players):
+    if num_players == 3:
+        if 0 <= c_idx < len(COMPACT_TO_TILE34):
+            return TILE_TYPES[COMPACT_TO_TILE34[c_idx]]
+        return "?"
+    if 0 <= c_idx < len(TILE_TYPES):
+        return TILE_TYPES[c_idx]
+    return "?"
+
+def next_dora_34(ind34, num_players):
+    if num_players == 3:
+        if ind34 == 0:
+            return 8
+        if ind34 == 8:
+            return 0
+    if 0 <= ind34 <= 8:
+        return 0 if ind34 == 8 else ind34 + 1
+    if 9 <= ind34 <= 17:
+        return 9 if ind34 == 17 else ind34 + 1
+    if 18 <= ind34 <= 26:
+        return 18 if ind34 == 26 else ind34 + 1
+    if 27 <= ind34 <= 30:
+        return 27 if ind34 == 30 else ind34 + 1
+    if 31 <= ind34 <= 33:
+        return 31 if ind34 == 33 else ind34 + 1
+    return ind34
+
+class ResBlock1D(nn.Module):
+    def __init__(self, ch):
         super().__init__()
-        self.backbone = nn.Sequential(
-            nn.Linear(250, 512),
-            nn.LayerNorm(512),
-            nn.ReLU(),
-            nn.Dropout(0.15),
-            nn.Linear(512, 384),
-            nn.LayerNorm(384),
-            nn.ReLU(),
-            nn.Dropout(0.1)
-        )
-        self.policy_head = nn.Linear(384, 34)
-        self.danger_head = nn.Linear(384, 34)
+        self.conv1 = nn.Conv1d(ch, ch, 3, padding=1, bias=True)
+        self.conv2 = nn.Conv1d(ch, ch, 3, padding=1, bias=True)
 
     def forward(self, x):
-        h = self.backbone(x)
-        return self.policy_head(h), self.danger_head(h)
+        y = F.relu(self.conv1(x))
+        y = self.conv2(y)
+        return F.relu(y + x)
 
-def build_feature_vector(
-    hand,
-    my_discards,
-    all_discards,
-    opp_tedashi,
-    opp_melds,
-    dora_vec,
-    last_discard_idx,
-    bakaze,
-    jikaze,
+class AkagiResNet(nn.Module):
+    def __init__(self, num_players, conv=64, blocks=3, fc=256):
+        super().__init__()
+        self.num_players = num_players
+        self.tile_dim = 27 if num_players == 3 else 34
+        self.channels = 37 if num_players == 3 else 39
+        self.action_space = 60 if num_players == 3 else 82
+
+        self.conv_in = nn.Conv1d(self.channels, conv, 3, padding=1, bias=True)
+        self.res = nn.ModuleList([ResBlock1D(conv) for _ in range(blocks)])
+        self.fc = nn.Linear(conv * self.tile_dim, fc)
+        self.head = nn.Linear(fc, self.action_space)
+        self.hand_read_head = nn.Linear(fc, self.tile_dim)
+
+    def forward(self, x, return_hand_read=False):
+        x = F.relu(self.conv_in(x))
+        for r in self.res:
+            x = r(x)
+        x = torch.flatten(x, 1)
+        feat = F.relu(self.fc(x))
+        policy_logits = self.head(feat)
+        if return_hand_read:
+            read_logits = self.hand_read_head(feat)
+            return policy_logits, read_logits
+        return policy_logits
+
+def load_pretrained_resnet(base_dir, mode, device):
+    num_players = 3 if mode == "3p" else 4
+    model = AkagiResNet(num_players).to(device)
+    pt_path = os.path.join(base_dir, "auto_learn", "models", f"active_model_{mode}.pt")
+    sf_path = os.path.join(base_dir, "auto_learn", "pretrained", f"akagi{num_players}p.safetensors")
+    if os.path.exists(pt_path):
+        sd = torch.load(pt_path, map_location=device, weights_only=True)
+        model.load_state_dict(sd, strict=False)
+        return model, "adaptive"
+    if os.path.exists(sf_path):
+        sd = load_file(sf_path, device=str(device))
+        model.load_state_dict(sd, strict=False)
+        return model, "pretrained"
+    return model, "random"
+
+def encode_observation(
+    num_players,
+    hand_tiles,
+    drawn_tile,
+    waits_34,
+    is_tenpai,
+    dora_indicators,
+    seats_rel,
+    last_discard,
+    round_wind,
+    seat_wind,
+    honba,
+    riichi_sticks,
     turn_count,
-    riichi_flags,
-    kita_counts,
-    num_players
+    is_dealer,
+    kyoku_index,
+    self_riichi
 ):
-    hand_vec = [0.0] * 34
-    for t in hand:
-        base = normalize_tile(t)
-        if base in TILE_TO_IDX:
-            hand_vec[TILE_TO_IDX[base]] += 0.25
-    my_disc_vec = [min(c * 0.25, 1.0) for c in my_discards]
-    all_disc_vec = [min(c * 0.25, 1.0) for c in all_discards]
-    tedashi_vec = [min(c * 0.25, 1.0) for c in opp_tedashi]
-    meld_vec = [min(c * 0.25, 1.0) for c in opp_melds]
-    last_disc_vec = [0.0] * 34
-    if 0 <= last_discard_idx < 34:
-        last_disc_vec[last_discard_idx] = 1.0
-    r_padded = (riichi_flags + [0.0] * 4)[:4]
-    k_padded = [min(c * 0.25, 1.0) for c in (kita_counts + [0] * 3)[:3]]
-    context_vec = [
-        1.0 if num_players == 3 else 0.0,
-        1.0 if bakaze == 27 else 0.0,
-        1.0 if bakaze == 28 else 0.0,
-        1.0 if jikaze == 27 else 0.0,
-        min(turn_count / 18.0, 1.0)
-    ] + r_padded + k_padded
-    return (
-        hand_vec
-        + my_disc_vec
-        + all_disc_vec
-        + tedashi_vec
-        + meld_vec
-        + dora_vec
-        + last_disc_vec
-        + context_vec
-    )
+    t = 27 if num_players == 3 else 34
+    c = 37 if num_players == 3 else 39
+    buf = [0.0] * (c * t)
+    ch = 0
 
-def extract_features_from_engine_state(state, num_players, opp_tedashi, opp_melds, last_discard_idx):
-    hand_vec = [min(c * 0.25, 1.0) for c in state.hand34]
-    my_disc_vec = [0.0] * 34
-    all_disc_vec = [0.0] * 34
-    for seat_idx, river in enumerate(state.rivers):
-        for t in river:
-            base = normalize_tile(t)
-            if base in TILE_TO_IDX:
-                idx = TILE_TO_IDX[base]
-                all_disc_vec[idx] = min(all_disc_vec[idx] + 0.25, 1.0)
-                if seat_idx == state.actor_id:
-                    my_disc_vec[idx] = min(my_disc_vec[idx] + 0.25, 1.0)
-    tedashi_vec = [min(c * 0.25, 1.0) for c in opp_tedashi]
-    meld_vec = [min(c * 0.25, 1.0) for c in opp_melds]
-    dora_vec = [0.0] * 34
-    for dm in getattr(state, "dora_markers", []):
-        base = normalize_tile(dm)
-        if base in TILE_TO_IDX:
-            dora_vec[TILE_TO_IDX[base]] = 1.0
-    last_disc_vec = [0.0] * 34
-    if 0 <= last_discard_idx < 34:
-        last_disc_vec[last_discard_idx] = 1.0
-    bakaze = TILE_TO_IDX.get(state.round_wind_mjai(), 27)
-    jikaze = TILE_TO_IDX.get(state.seat_wind_mjai(), 27)
-    turn_count = len(state.rivers[state.actor_id])
-    riichi_flags = [0.0] * 4
-    for s in getattr(state, "reach_accepted_seats", set()):
-        if 0 <= s < 4:
-            riichi_flags[s] = 1.0
-    kita_counts = [0.0] * 3
-    if hasattr(state, "kita"):
-        for s in range(min(3, len(state.kita))):
-            kita_counts[s] = min(len(state.kita[s]) * 0.25, 1.0)
-    context_vec = [
-        1.0 if num_players == 3 else 0.0,
-        1.0 if bakaze == 27 else 0.0,
-        1.0 if bakaze == 28 else 0.0,
-        1.0 if jikaze == 27 else 0.0,
-        min(turn_count / 18.0, 1.0)
-    ] + riichi_flags + kita_counts
-    return (
-        hand_vec
-        + my_disc_vec
-        + all_disc_vec
-        + tedashi_vec
-        + meld_vec
-        + dora_vec
-        + last_disc_vec
-        + context_vec
-    )
+    hand_counts = [0] * t
+    aka_here = [False, False, False]
+    for ts in hand_tiles:
+        t34 = tile34_from_str(ts)
+        idx = compact_idx_from_34(t34, num_players)
+        if idx is not None:
+            hand_counts[idx] += 1
+        if ts == "5mr":
+            aka_here[0] = True
+        elif ts == "5pr":
+            aka_here[1] = True
+        elif ts == "5sr":
+            aka_here[2] = True
 
-class HybridNeuralEvaluator:
-    def __init__(self, base_dir, mode):
-        self.mode = mode
-        self.num_players = 3 if mode == "3p" else 4
-        self.model_path = os.path.join(base_dir, "auto_learn", "models", f"active_model_{mode}.pt")
-        self.device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-        self.model = MahjongMultiTaskNet().to(self.device)
-        self.is_loaded = False
-        self.opp_tedashi = [0] * 34
-        self.opp_melds = [0] * 34
-        self.last_discard_idx = -1
-        if os.path.exists(self.model_path):
-            try:
-                state = torch.load(self.model_path, map_location=self.device, weights_only=True)
-                self.model.load_state_dict(state)
-                self.is_loaded = True
-            except Exception:
-                self.is_loaded = False
-        self.model.eval()
+    for thresh in (1, 2, 3, 4):
+        for idx in range(t):
+            if hand_counts[idx] >= thresh:
+                buf[ch * t + idx] = 1.0
+        ch += 1
 
-    def observe_event(self, event, my_actor_id):
-        etype = event.get("type")
-        if etype == "start_kyoku":
-            self.opp_tedashi = [0] * 34
-            self.opp_melds = [0] * 34
-            self.last_discard_idx = -1
-        elif etype == "dahai":
-            actor = event.get("actor")
-            pai = event.get("pai")
-            if pai:
-                idx = TILE_TO_IDX.get(normalize_tile(pai), -1)
-                if idx >= 0:
-                    self.last_discard_idx = idx
-                    if actor != my_actor_id and not event.get("tsumogiri", False):
-                        self.opp_tedashi[idx] += 1
-        elif etype in ("pon", "chi", "kan", "daiminkan", "kakan", "ankan"):
-            actor = event.get("actor")
-            if actor != my_actor_id:
-                pai = event.get("pai")
-                if pai:
-                    idx = TILE_TO_IDX.get(normalize_tile(pai), -1)
-                    if idx >= 0:
-                        self.opp_melds[idx] += 1
-                for c in event.get("consumed", []):
-                    c_idx = TILE_TO_IDX.get(normalize_tile(c), -1)
-                    if c_idx >= 0:
-                        self.opp_melds[c_idx] += 1
+    for k, a34 in enumerate((4, 13, 22)):
+        if aka_here[k]:
+            idx = compact_idx_from_34(a34, num_players)
+            if idx is not None:
+                buf[ch * t + idx] = 1.0
+    ch += 1
 
-    def evaluate_situation(self, state):
-        if not self.is_loaded:
-            return [0.0] * 34, [0.0] * 34
-        features = extract_features_from_engine_state(
-            state,
-            self.num_players,
-            self.opp_tedashi,
-            self.opp_melds,
-            self.last_discard_idx
-        )
-        tensor_x = torch.tensor([features], dtype=torch.float32, device=self.device)
-        with torch.no_grad():
-            policy_logits, danger_logits = self.model(tensor_x)
-            danger_probs = torch.sigmoid(danger_logits)[0].cpu().tolist()
-            policy_scores = policy_logits[0].cpu().tolist()
-        return policy_scores, danger_probs
+    if drawn_tile:
+        idx = compact_idx_from_34(tile34_from_str(drawn_tile), num_players)
+        if idx is not None:
+            buf[ch * t + idx] = 1.0
+    ch += 1
+
+    for w34 in waits_34:
+        idx = compact_idx_from_34(w34, num_players)
+        if idx is not None:
+            buf[ch * t + idx] = 1.0
+    ch += 1
+
+    for dm in dora_indicators:
+        idx = compact_idx_from_34(tile34_from_str(dm), num_players)
+        if idx is not None:
+            buf[ch * t + idx] += 0.25
+    ch += 1
+
+    for dm in dora_indicators:
+        d34 = next_dora_34(tile34_from_str(dm), num_players)
+        idx = compact_idx_from_34(d34, num_players)
+        if idx is not None:
+            buf[ch * t + idx] += 0.25
+    ch += 1
+
+    for seat in seats_rel:
+        for d in seat["discards"]:
+            idx = compact_idx_from_34(tile34_from_str(d), num_players)
+            if idx is not None:
+                buf[ch * t + idx] += 0.25
+        ch += 1
+
+    for seat in seats_rel:
+        for m in seat["melds"]:
+            idx = compact_idx_from_34(tile34_from_str(m), num_players)
+            if idx is not None:
+                buf[ch * t + idx] += 0.25
+        ch += 1
+
+    for seat in seats_rel:
+        if seat["riichi"]:
+            for i in range(t):
+                buf[ch * t + i] = 1.0
+        ch += 1
+
+    for seat in seats_rel:
+        rt = seat.get("riichi_tile")
+        if rt:
+            idx = compact_idx_from_34(tile34_from_str(rt), num_players)
+            if idx is not None:
+                buf[ch * t + idx] = 1.0
+        ch += 1
+
+    for seat in seats_rel:
+        v = max(0.0, min(4.0, float(seat["score"]) / 50000.0))
+        for i in range(t):
+            buf[ch * t + i] = v
+        ch += 1
+
+    if last_discard:
+        idx = compact_idx_from_34(tile34_from_str(last_discard), num_players)
+        if idx is not None:
+            buf[ch * t + idx] = 1.0
+    ch += 1
+
+    rw_idx = compact_idx_from_34(27 + min(3, max(0, round_wind)), num_players)
+    if rw_idx is not None:
+        buf[ch * t + rw_idx] = 1.0
+    ch += 1
+
+    sw_idx = compact_idx_from_34(27 + min(3, max(0, seat_wind)), num_players)
+    if sw_idx is not None:
+        buf[ch * t + sw_idx] = 1.0
+    ch += 1
+
+    scalars = [
+        min(2.0, float(honba) / 4.0),
+        min(2.0, float(riichi_sticks) / 4.0),
+        min(1.0, float(turn_count) / 70.0),
+        1.0 if is_tenpai else 0.0,
+        1.0 if is_dealer else 0.0,
+        min(1.0, float(kyoku_index) / 8.0),
+        1.0 if self_riichi else 0.0
+    ]
+    for val in scalars:
+        for i in range(t):
+            buf[ch * t + i] = val
+        ch += 1
+
+    if num_players == 3:
+        for seat in seats_rel:
+            kv = min(1.0, float(seat.get("kita", 0)) / 4.0)
+            for i in range(t):
+                buf[ch * t + i] = kv
+            ch += 1
+
+    return buf

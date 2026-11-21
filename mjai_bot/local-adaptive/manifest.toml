@@ -5,5 +5,6 @@ name = "local-adaptive"
 display = "Local Adaptive AI (4P)"
 description = "Self-learning neural network fused with rule-based optimizer."
 version = "1.0.0"
+supported_modes = ["4p"]
 
 [settings]

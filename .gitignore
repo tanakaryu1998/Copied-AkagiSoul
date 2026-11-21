@@ -9,3 +9,4 @@ logs/
 ca/
 .DS_Store
 EOF.venv/
+auto_learn/pretrained/

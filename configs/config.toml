@@ -19,8 +19,8 @@ block_telemetry = true
 
 [bot]
 enabled = true
-active_4p = "akagi-native"
-active_3p = "akagi-native3p"
+active_4p = "local-adaptive"
+active_3p = "local-adaptive3p"
 auto_sync = true
 dir = "mjai_bot"
 
@@ -40,8 +40,8 @@ mode = "chromium"
 [capture.chromium]
 executable = ""
 user_data_dir = ""
-start_url = "https://game.maj-soul.com/1/"
-cft_channel = "stable"
+start_url = "https://game.mahjongsoul.com/"
+cft_channel = "Beta"
 force_cft = true
 extra_args = []
 block_telemetry = true
@@ -53,11 +53,11 @@ max_body_bytes = 262144
 static_assets = false
 
 [autoplay]
-enabled = false
+enabled = true
 
 [autoplay.majsoul]
-pre_click_delay_min_ms = 1000
-pre_click_delay_max_ms = 3000
+pre_click_delay_min_ms = 600
+pre_click_delay_max_ms = 1500
 inter_click_delay_ms = [
     250,
     500,
@@ -74,7 +74,7 @@ verify_input_ms = [
     300,
     500,
 ]
-click_retries = 2
+click_retries = 6
 reload_after_failures = 3
 dealer_first_discard_extra_delay_ms = [
     2000,
