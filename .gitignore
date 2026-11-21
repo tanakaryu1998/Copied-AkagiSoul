@@ -10,3 +10,8 @@ ca/
 .DS_Store
 EOF.venv/
 auto_learn/pretrained/
+chrome-for-testing/
+chrome-profile/
+*.venv/
+.venv/
+*.log
