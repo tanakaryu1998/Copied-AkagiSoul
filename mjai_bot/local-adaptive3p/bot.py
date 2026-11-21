@@ -116,6 +116,7 @@ class Adaptive3PSession:
         self.kyoku_index = 0
         self.turn_count = 0
         self.last_opp_read_probs = None
+        self.pending_reach_pai = None
 
     def observe(self, ev):
         etype = ev.get("type")
@@ -124,6 +125,7 @@ class Adaptive3PSession:
             self.riichi_tiles = [None] * 3
             self.kita_counts = [0] * 3
             self.last_opp_read_probs = None
+            self.pending_reach_pai = None
             self.kyoku_index = max(0, ev.get("kyoku", 1) - 1)
             self.turn_count = 0
             if "scores" in ev and len(ev["scores"]) >= 3:
@@ -135,6 +137,8 @@ class Adaptive3PSession:
             actor = ev.get("actor")
             pai = ev.get("pai")
             self.last_discard = pai
+            if actor == self.state.actor_id:
+                self.pending_reach_pai = None
             if actor is not None and 0 <= actor < 3:
                 if actor in getattr(self.state, "reach_declared_seats", set()) and self.riichi_tiles[actor] is None:
                     self.riichi_tiles[actor] = pai
@@ -142,6 +146,10 @@ class Adaptive3PSession:
             actor = ev.get("actor")
             if actor is not None and 0 <= actor < 3:
                 self.kita_counts[actor] += 1
+            if actor == self.state.actor_id:
+                self.state._remove(ev.get("pai") or "N")
+            if actor == self.state.actor_id:
+                self.state._remove(ev.get("pai") or "N")
         elif etype == "reach_accepted":
             actor = ev.get("actor")
             if actor is not None and 0 <= actor < 3:
@@ -266,13 +274,11 @@ class Adaptive3PSession:
                 pai = f"5{suit}r"
         return pai
 
-    def _can_kita_safely(self, hand14):
-        if hand14[30] <= 0 or self.state.reach_declared or self.state.reach_accepted:
+    def _can_kita(self, hand14):
+        if hand14[30] <= 0:
             return False
-        # 北を抜いたあとの13枚形（北を1枚減らす）で向聴数を確認
         after_kita13 = list(hand14)
         after_kita13[30] -= 1
-        # 打牌14枚->13枚時の最良向聴数と比較
         best_dahai_sh = 99
         for idx in range(34):
             if hand14[idx] > 0:
@@ -282,8 +288,87 @@ class Adaptive3PSession:
                 if sh < best_dahai_sh:
                     best_dahai_sh = sh
         kita_sh = base_engine._shanten_with_melds(after_kita13, len(self.state.melds))
-        # 北を抜いて向聴数が悪化しない場合のみ許可
         return kita_sh <= best_dahai_sh
+
+    def _find_best_reach_pai(self, hand14, logits):
+        if not self.state.is_closed() or self.state.reach_declared or self.state.reach_accepted:
+            return None
+        if self.state.left_tiles < 4 or self.scores[self.state.actor_id] < 1000:
+            return None
+        best = None
+        for idx in range(34):
+            if hand14[idx] == 0:
+                continue
+            t = list(hand14)
+            t[idx] -= 1
+            if base_engine._shanten_with_melds(t, len(self.state.melds)) == 0:
+                waits = base_engine._tenpai_waits(t, len(self.state.melds))
+                if waits:
+                    c_idx = compact_idx_from_34(idx, 3)
+                    sc = logits[c_idx] if c_idx is not None else -1e9
+                    cand = (sc, len(waits), self._pai_for_index(idx, hand14))
+                    if best is None or cand > best:
+                        best = cand
+        return best[2] if best is not None else None
+
+    def decide_dahai_followup(self, drawn=""):
+        actor = self.state.actor_id
+        hand14 = list(self.state.hand34)
+        logits = self._build_logits()
+        scored = []
+
+        if not self.state.reach_accepted:
+            sh14 = base_engine._shanten_with_melds(hand14, len(self.state.melds))
+            for idx in range(34):
+                if hand14[idx] >= 4:
+                    test = list(hand14)
+                    test[idx] = 0
+                    if base_engine._shanten_with_melds(test, len(self.state.melds) + 1) <= sh14:
+                        base_pai = base_engine._from34(idx)
+                        consumed = [base_pai] * 4
+                        if base_pai[0] == "5" and len(base_pai) >= 2 and base_pai[1] in "mps":
+                            s_ch = base_pai[1]
+                            if self.state.aka_in_hand.get(s_ch, 0) >= 1:
+                                consumed = [f"5{s_ch}r", base_pai, base_pai, base_pai]
+                        c_idx = compact_idx_from_34(idx, 3) if is_3p else idx
+                        a_score = logits[29 + c_idx] if (is_3p and c_idx is not None and 29 + c_idx < len(logits)) else (
+                            logits[42 + idx] if (not is_3p and 42 + idx < len(logits)) else 0.0
+                        )
+                        scored.append((a_score, {"type": "ankan", "actor": actor, "consumed": consumed}))
+        for idx in range(34):
+            if hand14[idx] == 0:
+                continue
+            c_idx = compact_idx_from_34(idx, 3)
+            if c_idx is None:
+                continue
+            if self.pending_reach_pai is not None:
+                t = list(hand14)
+                t[idx] -= 1
+                if base_engine._shanten_with_melds(t, len(self.state.melds)) != 0:
+                    continue
+            pai = self._pai_for_index(idx, hand14)
+            scored.append((logits[c_idx], {
+                "type": "dahai",
+                "actor": actor,
+                "pai": pai,
+                "tsumogiri": bool(drawn) and pai == drawn,
+            }))
+        if not scored:
+            for idx in range(34):
+                if hand14[idx] > 0:
+                    pai = self._pai_for_index(idx, hand14)
+                    act = {
+                        "type": "dahai",
+                        "actor": actor,
+                        "pai": pai,
+                        "tsumogiri": bool(drawn) and pai == drawn,
+                    }
+                    return act, format_overlay_meta([(1.0, act)])
+            return {"type": "none"}, None
+        scored.sort(key=lambda x: x[0], reverse=True)
+        chosen = scored[0][1]
+        self.pending_reach_pai = None
+        return chosen, format_overlay_meta(scored)
 
     def decide_tsumo(self, last_event):
         actor = self.state.actor_id
@@ -291,31 +376,40 @@ class Adaptive3PSession:
         drawn_idx = base_engine._to34(drawn)
         hand14 = list(self.state.hand34)
 
+        if self.pending_reach_pai is not None:
+            pai = self.pending_reach_pai
+            self.pending_reach_pai = None
+            act = {"type": "dahai", "actor": actor, "pai": pai, "tsumogiri": pai == drawn}
+            return act, format_overlay_meta([(10.0, act)])
+
         res = base_engine._hand_value(self.state, hand14, self.state.aka_in_hand, drawn_idx, is_tsumo=True)
-        if res.cost is not None:
+        can_tsumo_hora = (res.cost is not None)
+        if not can_tsumo_hora and base_engine._shanten_with_melds(hand14, len(self.state.melds)) == -1:
+            rule_tsumo = base_engine.decide_after_own_tsumo(self.state, last_event)
+            if rule_tsumo.get("type") == "hora":
+                can_tsumo_hora = True
+        if can_tsumo_hora:
             hora_act = {"type": "hora", "actor": actor, "target": actor, "pai": drawn}
             dahai_act = {"type": "dahai", "actor": actor, "pai": drawn, "tsumogiri": True}
-            return hora_act, format_overlay_meta([(10.0, hora_act), (0.0, dahai_act)])
-
-        if self.state.reach_accepted:
-            act = {"type": "dahai", "actor": actor, "pai": drawn, "tsumogiri": True}
-            return act, format_overlay_meta([(10.0, act)])
+            return hora_act, format_overlay_meta([(20.0, hora_act), (0.0, dahai_act)])
 
         logits = self._build_logits()
         scored = []
 
-        if self._can_kita_safely(hand14):
+        if self._can_kita(hand14):
             scored.append((logits[59], {"type": "kita", "actor": actor, "pai": "N"}))
 
-        if self.state.is_closed() and not self.state.reach_declared and self.state.left_tiles >= 4:
-            for idx in range(34):
-                if hand14[idx] == 0:
-                    continue
-                t = list(hand14)
-                t[idx] -= 1
-                if base_engine._shanten_with_melds(t, len(self.state.melds)) == 0:
-                    scored.append((logits[27], {"type": "reach", "actor": actor}))
-                    break
+        if self.state.reach_accepted:
+            tsumo_dahai = {"type": "dahai", "actor": actor, "pai": drawn, "tsumogiri": True}
+            scored.append((logits[compact_idx_from_34(drawn_idx, 3) or 0], tsumo_dahai))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            chosen = scored[0][1]
+            return chosen, format_overlay_meta(scored)
+
+        reach_pai = self._find_best_reach_pai(hand14, logits)
+        if reach_pai is not None:
+            self.pending_reach_pai = reach_pai
+            scored.append((logits[27], {"type": "reach", "actor": actor, "pai": reach_pai}))
 
         for idx in range(34):
             if hand14[idx] == 0:
@@ -336,16 +430,41 @@ class Adaptive3PSession:
             return act, format_overlay_meta([(1.0, act)])
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        chosen = scored[0][1]
-        return chosen, format_overlay_meta(scored)
+        chosen = dict(scored[0][1])
+        meta = format_overlay_meta(scored)
+        if chosen.get("type") == "reach":
+            chosen.pop("pai", None)
+        else:
+            self.pending_reach_pai = None
+        return chosen, meta
 
     def decide_response(self, last_event):
+        actor = self.state.actor_id
         rule_action = base_engine.decide_after_others_dahai(self.state, last_event)
         rtype = rule_action.get("type")
         pass_act = {"type": "none"}
 
+        discarder = last_event.get("actor")
+        discarded = last_event.get("pai")
+        if discarded is not None and discarder is not None and discarder != actor:
+            didx = base_engine._to34(discarded)
+            own_river_idxs = {base_engine._to34(t) for t in self.state.rivers[actor]}
+            test14 = list(self.state.hand34)
+            if 0 <= didx < 34:
+                test14[didx] += 1
+            if didx not in own_river_idxs and base_engine._shanten_with_melds(test14, len(self.state.melds)) == -1:
+                aka_in = dict(self.state.aka_in_hand)
+                if discarded.endswith("r"):
+                    s_ch = discarded[1] if len(discarded) >= 2 else ""
+                    if s_ch in aka_in:
+                        aka_in[s_ch] = aka_in.get(s_ch, 0) + 1
+                hval = base_engine._hand_value(self.state, test14, aka_in, didx, is_tsumo=False)
+                if rtype == "hora" or hval.cost is not None or self.state.reach_accepted:
+                    ron_act = {"type": "hora", "actor": actor, "target": discarder, "pai": discarded}
+                    return ron_act, format_overlay_meta([(20.0, ron_act), (0.0, pass_act)])
+
         if rtype == "hora":
-            return rule_action, format_overlay_meta([(10.0, rule_action), (0.0, pass_act)])
+            return rule_action, format_overlay_meta([(20.0, rule_action), (0.0, pass_act)])
 
         if rtype in ("pon", "daiminkan"):
             logits = self._build_logits()
@@ -389,6 +508,13 @@ def react(session: Adaptive3PSession, line: str) -> str:
 
     if t == "tsumo" and last.get("actor") == actor:
         action, meta = session.decide_tsumo(last)
+    elif t in ("pon", "chi", "daiminkan") and last.get("actor") == actor:
+        if hasattr(session, "decide_dahai_followup"):
+            action, meta = session.decide_dahai_followup(session.state.last_self_tsumo or "")
+        else:
+            action, meta = session.decide_tsumo({"type": "tsumo", "actor": actor, "pai": session.state.last_self_tsumo or base_engine._from34(next((i for i, c in enumerate(session.state.hand34) if c > 0), 0))})
+    elif t == "reach" and last.get("actor") == actor:
+        action, meta = session.decide_dahai_followup(session.state.last_self_tsumo or "")
     elif t == "dahai" and last.get("actor") != actor:
         action, meta = session.decide_response(last)
     elif t == "kakan" and last.get("actor") != actor:
